@@ -1,0 +1,7 @@
+pip install --upgrade --user numpy 
+pip install --upgrade --user mdtraj
+pip install --upgrade --user msmbuilder
+pip install --upgrade --user seaborn
+
+gfortran -static -O3 -ffast-math -lm -o TMalign TMalign.f
+gfortran -static -O3 -ffast-math -lm -o TMscore TMscore.f

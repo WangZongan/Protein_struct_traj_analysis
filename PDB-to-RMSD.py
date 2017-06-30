@@ -1,0 +1,268 @@
+#!/usr/bin/env python
+'''
+Given pdb file(s), calculate the RMSD values using Bio.PDB. 
+'''
+__author__  = 'Wang Zongan'
+__version__ = '2016-10-27'
+
+import os
+import sys
+import string
+import numpy as np
+import cPickle as cp
+
+import Bio.PDB 
+
+import seaborn as sns
+sns.set_style(style='white')
+from matplotlib.pyplot import *
+
+backbone = ['C','CA','N'] 
+backbone_O = ['C','CA','N','O']  
+
+three_letter_aa = dict(
+    A='ALA', C='CYS', D='ASP', E='GLU',
+    F='PHE', G='GLY', H='HIS', I='ILE',
+    K='LYS', L='LEU', M='MET', N='ASN',
+    P='PRO', Q='GLN', R='ARG', S='SER',
+    T='THR', V='VAL', W='TRP', Y='TYR')
+
+aa_num = dict([(k,i) for i,k in enumerate(sorted(three_letter_aa.values()))])
+
+one_letter_aa = dict([(v,k) for k,v in three_letter_aa.items()])
+one_letter_aa['CPR'] = 'P'
+
+
+def get_fasta(structure):
+    fasta_seq = [res.get_resname() for res in structure[0].get_residues() if res.get_id()[0] == ' ']
+    return ''.join(one_letter_aa[x] for x in fasta_seq) 
+
+
+def load_pdb_BioPDB(pdbfile):
+    return Bio.PDB.PDBParser(QUIET=True).get_structure('protein', pdbfile)
+
+
+def calculate_rmsd(reference_model, comparison_structure, selection, residue_selection):
+    # Make a list of the atoms (in the structures) wished to align.
+    # exclude HET residues and water molecures
+    ref_residues = [res for res in reference_model.get_residues() if res.get_id()[0] == ' ']
+    ref_residues = [ref_residues[i] for i in residue_selection]
+    ref_atoms = [] 
+    for res in ref_residues:
+        if selection == 'CA':
+            ref_atoms.append(res['CA'])
+        elif selection == 'backbone':
+            for atom_name in backbone:
+                ref_atoms.append(res[atom_name]) 
+        elif selection == 'backbone_O': 
+            for atom_name in backbone_O: 
+                com_atoms.append(res[atom_name]) 
+        elif selection == 'all':
+            for atom in res:
+                ref_atoms.append(atom)
+
+    rmsds = np.zeros(len(comparison_structure))
+
+    for nm,model in enumerate(comparison_structure):
+        com_residues = [res for res in model.get_residues() if res.get_id()[0] == ' ']
+        com_residues = [com_residues[i] for i in residue_selection]
+        com_atoms = [] 
+        for res in com_residues:
+            if selection == 'CA':
+                com_atoms.append(res['CA'])
+            elif selection == 'backbone':
+                for atom_name in backbone:
+                    com_atoms.append(res[atom_name]) 
+            elif selection == 'backbone_O': 
+                for atom_name in backbone_O: 
+                    com_atoms.append(res[atom_name]) 
+            elif selection == 'all':
+                for atom in res:
+                    com_atoms.append(atom) 
+
+        assert len(ref_atoms) == len(com_atoms)
+        super_imposer = Bio.PDB.Superimposer() # initiate the superimposer
+        super_imposer.set_atoms(ref_atoms,com_atoms)
+        super_imposer.apply(com_atoms)
+        rmsds[nm] = super_imposer.rms
+
+    return np.array(rmsds)
+
+
+def plot_rmsd(rmsds, name_lists, selection, plot_format='png', plot_color_map='spectral'): 
+    nstructure = len(rmsds)
+    nmodels = [len(s) for s in rmsds]
+
+    fig = figure(figsize=(10,10))
+    title('RMSD',fontsize=20)
+    my_cmap = get_cmap(plot_color_map)(np.linspace(0,1,nstructure))
+
+    for i,c in zip(range(nstructure),my_cmap):
+        plot(rmsds[i],color=c,label=name_lists[i])
+
+    legend(loc='best',fontsize='large')  
+    xlabel('Number of models',fontsize=20) 
+    ylabel('RMSD / A',fontsize=20)
+    xlim(0,)
+    ylim(0,)
+    tick_params(axis='both', which='major', labelsize=15)
+    grid()
+    tight_layout() # default is (0, 0, 1, 1) [left, bottom, right, top]
+    savefig('%s.%s.rmsd.%s'%(name_lists[0], selection, plot_format), format=plot_format) 
+
+
+def plot_rmsd_distribution(rmsds, name_lists, selection, plot_format='png', plot_color_map='spectral'):
+    nstructure = len(rmsds)
+    nmodels = [len(s) for s in rmsds]
+
+    fig = figure(figsize=(10,10))
+    title('RMSD distribution',fontsize=20)
+    my_cmap = get_cmap(plot_color_map)(np.linspace(0,1,nstructure)) 
+
+    for i,c in zip(range(nstructure),my_cmap): 
+        nbins = int(rmsds[i].max() - rmsds[i].min())
+        sns.distplot(rmsds[i], hist=False, label=name_lists[i], kde_kws={"color": c}, hist_kws={"normed":True, "bins":nbins})  
+
+    legend(loc='upper left',fontsize='large')  
+    xlabel('RMSD / A',fontsize=20) 
+    ylabel('Probability',fontsize=20) 
+    xlim(0,)
+    tick_params(axis='both', which='major', labelsize=15)
+    grid()
+    tight_layout() # default is (0, 0, 1, 1) [left, bottom, right, top]
+    savefig('%s.%s.rmsd_distribution.%s'%(name_lists[0], selection, plot_format), format=plot_format)  
+
+
+def parse_segments(s):
+    ''' Parse segments of the form 10-30,50-60 '''
+    import re
+
+    if re.match('^([0-9]+(-[0-9]+)?)(,[0-9]+(-[0-9]+)?)*$', s) is None:
+        raise argparse.ArgumentTypeError('segments must be of the form 10-30,45,72-76 or similar')
+
+    def parse_seg(x):
+        atoms = x.split('-')
+        if len(atoms) == 1:
+            return np.array([int(atoms[0])])
+        elif len(atoms) == 2:
+            return np.arange(int(atoms[0]),1+int(atoms[1]))  # inclusive on both ends
+        else:
+            raise RuntimeError('the impossible happened.  oops.')
+
+    ints = np.concatenate([parse_seg(a) for a in s.split(',')])
+    ints = np.array(sorted(set(ints)))   # remove duplicates and sort
+    return ints
+
+
+def sec_to_hr_min_sec(sec):
+    m, s = divmod(sec, 60)
+    h, m = divmod(m, 60)
+    return "%d:%02d:%02d" % (h, m, s)
+
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(
+        usage ='use "python %(prog)s --help" for more information',
+        description = 'Calculate and plot RMSD map for a given pdb file using Bio.PDB. ')
+    parser.add_argument('pdb', help='[required] input PDB file.')
+    parser.add_argument('--more-pdb', default=[], action='append', type=str, help='More input PDB file(s).')
+    parser.add_argument('--reference-model', default=[], action='append', type=str, 
+        help = "If the reference model(s) is(are) not provided, " +  
+               "the first model in the pdb structure will be selected as the reference. " + 
+               "This argument can be selected multiple times.")
+
+    parser.add_argument('--selection', default='CA', type=str, 
+        help = "This option specifies the selection used to align the models and calculate the RMSD values. " +
+               "Available selections are: 'CA' (only select CA atoms from the structures), " + 
+               "'backbone' (only select backbone atoms: N CA C), " + 
+               "'backbone_O' (only select backbone atoms: N CA C O), " + 
+               "'all' (select all protein atoms). The default value is CA.") 
+    parser.add_argument('--residue-selection', default=None, type=parse_segments,
+        help = "If provided, only the RMSD of the selected residues will be calculated; otherwise, all residues are selected. "+
+               "The selection if of the form 10-30,50-60.")
+
+    parser.add_argument('--plot-format', default='png', type=str,
+        help = 'Format of output plot, PNG format by default. Any format supported by matplotlib can be used.')
+    parser.add_argument('--plot-color-map', default='spectral', type=str, 
+        help = "Color map used in plotting, spectral by default. " +
+               "Any color map supported by matplotlib can be used. " + 
+               "Examples are: 'Blues', 'GnBu', 'BrBG', 'gist_rainbow', etc. " + 
+               "(Ref: http://matplotlib.org/xkcd/examples/color/colormaps_reference.html)")
+    parser.add_argument('--output-rmsd-file', default=False, action='store_true',
+        help = 'If turned on, output the csv file of RMSD values.')
+    args = parser.parse_args()
+
+    
+    name_lists = []
+    name_lists.append(os.path.splitext(os.path.basename(args.pdb))[0])
+    comparison_structures = []
+    comparison_structures.append(load_pdb_BioPDB(args.pdb))
+    
+    fasta_one_letter = get_fasta(comparison_structures[0])
+
+    if args.more_pdb:
+        for ns, structure in enumerate(args.more_pdb):
+            comparison_structures.append(load_pdb_BioPDB(structure))
+            name_lists.append(os.path.basename(args.more_pdb[ns]))
+
+    nstructure = len(name_lists)
+    nmodel_list = np.array([len(s) for s in comparison_structures]) 
+    nres_list = [len([res for res in s[0].get_residues() if res.get_id()[0] == ' ']) for s in comparison_structures] 
+    
+    selection = args.selection 
+
+    print '-' * 80
+    print '%i structures (i.e. trajectories) in total, ' % nstructure, 'Selection: %s' % selection
+    for i in range(nstructure):
+        print 'Structure %i: %i models, %i residues \n' % (i,nmodel_list[i],nres_list[i])
+
+    ref_name_lists = []
+    reference_model = []
+    if args.reference_model:
+        for ns, structure in enumerate(args.reference_model):
+            reference_model.append(load_pdb_BioPDB(structure)[0])
+            ref_name_lists.append(os.path.splitext(os.path.basename(args.reference_model[ns]))[0])
+    else:
+        reference_model.append(comparison_structures[0][0])
+        ref_name_lists.append(os.path.splitext(os.path.basename(args.pdb))[0])
+        print 'No referece model is provided, use the first model in the trajectory as reference.'
+    nref = len(reference_model)
+
+    print '%i reference modles in total ' % nref 
+    
+    if args.residue_selection != None:
+        residue_selection = set(args.residue_selection)
+        assert np.amax(list(residue_selection)) < len(fasta_one_letter)
+    else:
+        residue_selection = np.arange(nres_list[0])
+    
+    print
+    print 'Selected residues (uppercase letters are selected residues): '
+    print '%s' % ''.join((f.upper() if i in residue_selection else f.lower()) for i,f in enumerate(fasta_one_letter))
+
+    print '-' * 80
+    sys.stdout.flush()
+
+    rmsds = np.array([[calculate_rmsd(r,s,selection,residue_selection) for s in comparison_structures] for r in reference_model])
+
+    for i in range(nref):
+        plot_rmsd(rmsds[i], [nm+'.'+ref_name_lists[i] for nm in name_lists], 
+            selection, plot_format=args.plot_format, plot_color_map=args.plot_color_map)
+        plot_rmsd_distribution(rmsds[i], [nm+'.'+ref_name_lists[i] for nm in name_lists], 
+            selection, plot_format=args.plot_format, plot_color_map=args.plot_color_map)
+
+    if args.output_rmsd_file: 
+        for i, ref_name in enumerate(ref_name_lists):
+            for j, name in enumerate(name_lists):
+                with open('%s.%s.%s.rmsd.dat' % (name, ref_name, selection),'w') as f: 
+                    print >> f, '# %s %s' % (name, ref_name)
+                    for rmsd in rmsds[i][j]:
+                        print >> f, '%.3f' % rmsd
+
+if __name__ == '__main__':
+    import time
+    sta = time.time()
+    main()
+    print 'running time: %s' % sec_to_hr_min_sec(time.time() - sta)
+

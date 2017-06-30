@@ -1,0 +1,276 @@
+#!/usr/bin/env python
+'''
+This program is used for calculating and plotting the evolution of contact number in a given pdb trajectory. 
+Also, using the total number of contacts and percentage of native contacts as the reaction coordinates,
+this program plots the heat map of (# contacts, % native contacts).
+
+The distance between two residues can be defined in different ways:
+1. the distance between a specific pair of atoms (i.e., CA-CA or CB-CB),
+2. the shortest distance among the atoms belonging to residue i and those belonging to residue j
+3. the distance between the centers of mass of the two residues
+'''
+
+__author__  = 'Wang Zongan'
+__version__ = '2016-12-15'
+
+import os
+import sys 
+import string
+import numpy as np
+import cPickle as cp
+import Bio.PDB
+import seaborn as sns
+sns.set_style(style='white')
+from matplotlib.pyplot import *
+
+backbone = ['C','CA','N','O']
+
+def residue_distance_sidechainCM(res_1,res_2):
+    def residue_sidechainCM(res):
+        atoms = []
+        for atom in res.get_atom():
+            if atom not in backbone:
+                atoms.append(atom)
+        coord = np.zeros(3)
+        mass = 0
+        for atom in atoms:
+            coord += atom.get_coord()*atom.mass
+            mass += atom.mass
+        return coord/mass
+    res_1_coord = residue_sidechainCM(res_1)
+    res_2_coord = residue_sidechainCM(res_2)
+    diff_vec = res_1_coord - res_2_coord
+    return np.sqrt(np.sum(diff_vec*diff_vec,axis=0))
+
+
+def find_contact_distance_cutoff(structure, contact_type='CA', contact_cutoff=7.5):
+    nmodel = len(structure)
+    # exclude het-residues and water molecules
+    nres = len([res for res in structure[0].get_residues() if res.get_id()[0] == ' '])
+
+    '''
+    <Yuan et al. BMC Bioinformatics 13 (2012) 292>
+    contact_type:
+    1. 'CA': CA-CA contact, default cutoff 7.5
+    2. 'CB': CB-CB contact, default cutoff 7.0
+    3. 'CM': sidechain CM-CM contact, default cutoff 6.5
+    '''
+    # i: 0  ,...,n-5
+    # j: i+4,...,n-1
+    contacts = np.zeros((nmodel, nres, nres))
+    for nm, model in enumerate(structure):
+        residues = [res for res in structure[nm].get_residues() if res.get_id()[0] == ' '] 
+        assert len(residues) == nres
+        for r1 in range(nres-4):
+            res_1 = residues[r1]
+            for r2 in range(r1+4,nres):
+                res_2 = residues[r2]
+                if contact_type == 'CA':
+                    dist = res_1['CA'] - res_2['CA']
+                elif contact_type == 'CB':
+                    res_1_atom = res_1['CB'] if res_1.get_resname() != 'GLY' else res_1['CA']
+                    res_2_atom = res_2['CB'] if res_2.get_resname() != 'GLY' else res_2['CA']
+                    dist = res_1_atom - res_2_atom
+                elif contact_type == 'CM':
+                    dist = residue_distance_sidechainCM(res_1, res_2)
+                if dist <= contact_cutoff:
+                    contacts[nm,r1,r2] = contacts[nm,r2,r1] = 1
+    return contacts
+
+
+def find_native_contact(contacts, native_contact=None):
+    if native_contact is not None:
+        native_contact = native_contact[0]
+        assert contacts[0].shape == native_contact.shape
+    else:
+        native_contact = contacts[0]
+    traj_native_contacts = contacts * native_contact
+    return traj_native_contacts
+
+
+def find_contacts_between_two_selections(contacts, sel1, sel2):
+    '''
+    Selectoins should be residue indeces in 1D numpy array.
+    '''
+    assert set(sel1).intersect(sel2) == set()
+    return contacts[:,sel1,sel2]
+
+
+def plot_contact_number_evolution(
+        contacts, pdbfile, contact_type, cutoff, native_contact=None, plot_format='png'):
+
+    traj_native_contacts = find_native_contact(contacts, native_contact)
+    fig = figure(figsize=(12,10))
+    title('# Contacts V.S. Frame',fontsize=25)
+    plot(np.sum(np.sum(contacts,axis=-1),axis=-1)/2, color='green', label='# total contacts')
+    plot(np.sum(np.sum(traj_native_contacts,axis=-1),axis=-1)/2, color='red', label='# native contacts')
+    tick_params(axis='both', which='major', labelsize=15)
+    grid()
+    legend(loc='upper left', fontsize='x-large')
+    tight_layout()
+    savefig('%s.contact_number_evolutoin.%s.%s.%s' % 
+                (pdbfile, contact_type, str(cutoff), plot_format), 
+            format=plot_format)
+
+
+def plot_heat_map_contact_number(
+        contacts, pdbfile, contact_type, cutoff,
+        plot_color_map='Oranges', plot_format='png', native_contact=None):  
+    
+    if native_contact is not None:
+        NC = np.sum(native_contact[0])/2
+    else:
+        NC = np.sum(contacts[0])/2
+
+    number_contacts        = np.sum(np.sum(contacts,axis=-1),axis=-1)/2
+    number_native_contacts = np.sum(np.sum(find_native_contact(contacts, native_contact),axis=-1),axis=-1)/2
+
+    # heatmap : ndarray, (nx, ny)
+    heatmap, xedges, yedges = np.histogram2d(
+            number_contacts, number_native_contacts, 
+            bins=[np.linspace(number_contacts.min(), number_contacts.max(), 
+                              number_contacts.max() -number_contacts.min()+1),
+                  np.linspace(number_native_contacts.min(), number_native_contacts.max(), 
+                              number_native_contacts.max() -number_native_contacts.min()+1)],
+            normed=True)
+
+    extent = (       number_contacts.min(),        number_contacts.max(), 
+              number_native_contacts.min(), number_native_contacts.max())
+
+    fig = figure(figsize=(12,10))
+    suptitle('%s Contact Map: cutoff=%s'%(contact_type, str(cutoff)),fontsize=25,x=0.435,y=0.98)
+    title(pdbfile, fontsize=20)
+    my_cmap = get_cmap(plot_color_map)
+    my_cmap.set_under('w')
+
+    imshow(heatmap, origin='low', cmap=my_cmap, extent=extent, aspect='auto')
+
+    axvline(x=NC, color='blue', linewidth=4)
+    axhline(y=NC, color='blue')
+
+    xlim(       number_contacts.min(),        number_contacts.max())
+    ylim(number_native_contacts.min(), number_native_contacts.max())
+
+    tick_params(axis='both', which='major', labelsize=15)
+    fig.text(0.40, 0.03, '# total contacts' , ha='center', va='center', fontsize=25)
+    fig.text(0.02, 0.50, '# native contacts', ha='center', va='center', fontsize=25, rotation='vertical')
+    grid()
+
+    cb = colorbar()
+    #cb.set_label()
+    tight_layout(rect=[0.03, 0.05, 1, 0.95]) # default is (0, 0, 1, 1) [left, bottom, right, top]
+    savefig('%s.heat_map_contact_number.%s.%s.%s' % 
+            (pdbfile, contact_type, str(cutoff), plot_format), format=plot_format)  
+
+
+def parse_segments(s):
+    ''' Parse segments of the form 10-30,50-60 '''
+    import argparse
+    import re
+
+    if re.match('^([0-9]+(-[0-9]+)?)(,[0-9]+(-[0-9]+)?)*$', s) is None:
+        raise argparse.ArgumentTypeError('segments must be of the form 10-30,45,72-76 or similar')
+
+    def parse_seg(x):
+        atoms = x.split('-')
+        if len(atoms) == 1:
+            return np.array([int(atoms[0])])
+        elif len(atoms) == 2:
+            return np.arange(int(atoms[0]),1+int(atoms[1]))  # inclusive on both ends
+        else:
+            raise RuntimeError('the impossible happened.  oops.')
+
+    ints = np.concatenate([parse_seg(a) for a in s.split(',')])
+    ints = np.array(sorted(set(ints)))   # remove duplicates and sort
+    return ints
+
+
+def sec_to_hr_min_sec(sec):
+    m, s = divmod(sec, 60)
+    h, m = divmod(m, 60)
+    return "%d:%02d:%02d" % (h, m, s)
+
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(
+        description = 'Calculate and plot contact map for a given pdb file, ' +
+                      'which can contain a trajectory of structures.',
+        usage ='use "%(prog)s --help" for more information')
+    parser.add_argument('pdb', help='[required] input PDB file')
+    parser.add_argument('--contact-type', default='CA', type=str,
+        help = 'Contact type, options are CA, CB, CM, which stand for CA-CA contact, '+
+               'CB-CB contact, and sidechain CM-CM contact, respectively. '+
+               'Now all the contact types supported are distance cutoff contacts.' +
+               'The default value is CA.')
+    parser.add_argument('--contact-cutoff', default=7.5, type=float,
+        help = 'Suggested values for CA, CB, and CM contacts are 7.5, 7.0, 6.5 A, respectively. ' +
+               'The default value is 7.5 for the default CA contact.')
+
+    parser.add_argument('--reference-model', default=None, type=str,
+        help = 'If provided, the output plot of contact map will contain 2 parts, ' + 
+               'the lower half being the contact map of the reference and ' + 
+               'the upper half being the contact map of the pdb structure.')
+
+    parser.add_argument('--plot-color-map', default='coolwarm', type=str, 
+        help = "Color map used in plotting, coolwarm by default. " +
+               "Any color map supported by matplotlib can be used. " + 
+               "Examples are: 'Blues', 'GnBu', 'BrBG', 'gist_rainbow', etc. " + 
+               "(Ref: http://matplotlib.org/xkcd/examples/color/colormaps_reference.html)")
+    parser.add_argument('--plot-format', default='png', type=str,
+        help = 'Format of output plot, PNG format by default. ' +
+               'Any format supported by matplotlib can be used.')
+    parser.add_argument('--output-contact-number-file', default=None, type=str, 
+        help = 'If turned on, output the file containing the numbers of total contacts and native contacts.')
+    parser.add_argument('--not-plot', default=False, action='store_true', 
+        help = 'If turned on, not plot.')
+    args = parser.parse_args()
+
+    pdbfile = args.pdb
+    struct = Bio.PDB.PDBParser(QUIET=True).get_structure('protein', pdbfile)
+    nres = len([res for res in struct[0].get_residues() if res.get_id()[0] == ' '])
+    nmodel = len(struct)
+
+    print '=' * 40
+    print '%i models detected in the pdb file.' % nmodel
+    print '%i residues in the model' % nres
+    print '=' * 40
+
+    contacts = find_contact_distance_cutoff(struct, args.contact_type, args.contact_cutoff)
+
+    if args.reference_model is not None:
+        ref_structure = Bio.PDB.PDBParser(QUIET=True).get_structure('protein', args.reference_model)
+        ref_contacts = find_contact_distance_cutoff(ref_structure, args.contact_type, args.contact_cutoff)
+    else:
+        ref_contacts=None
+    
+    if not args.not_plot:
+        plot_contact_number_evolution(
+                contacts, 
+                os.path.basename(pdbfile), 
+                contact_type   = args.contact_type, 
+                cutoff         = args.contact_cutoff,
+                native_contact = ref_contacts,
+                plot_format    = args.plot_format)
+        plot_heat_map_contact_number(
+                contacts, 
+                os.path.basename(pdbfile),
+                contact_type   = args.contact_type,
+                cutoff         = args.contact_cutoff,
+                plot_color_map = args.plot_color_map,
+                plot_format    = args.plot_format,
+                native_contact = ref_contacts)
+
+    if args.output_contact_number_file is not None:
+        traj_native_contacts = find_native_contact(contacts, ref_contacts)
+        with open(args.output_contact_number_file,'w') as f:
+            for i in range(len(traj_native_contacts)):
+                f.write('%i %i\n' % (
+                    np.sum(np.sum(contacts,axis=-1),axis=-1)[i], 
+                    np.sum(np.sum(traj_native_contacts,axis=-1),axis=-1)[i] ))
+        
+if __name__ == '__main__':
+    from time import time
+    sta = time()
+    main()
+    print 'running time: %s' % sec_to_hr_min_sec(time() - sta)
